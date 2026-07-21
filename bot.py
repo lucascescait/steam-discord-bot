@@ -106,7 +106,7 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
                           nota_minima: int, excluir_indie: bool) -> dict | None:
     """Processa um item bruto da busca: pega detalhes + avaliação, aplica filtros."""
     appid = item.get("id") or item.get("appid")
-    # Fallback: às vezes o appid vem dentro de um atributo data-ds-appid ou logo/capsule url
+    # Fallback: o item de busca só traz name+logo — o appid vem embutido na URL do logo
     if not appid and item.get("logo"):
         import re
         m = re.search(r"/apps/(\d+)/", item.get("logo", ""))
@@ -115,17 +115,18 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
     if not appid:
         return None
 
-    discount = item.get("discount_percent", 0)
-    if discount < desconto_minimo:
-        return None
-
-    # Detalhes (gêneros + confirmação de preço)
+    # Detalhes completos — inclusive o desconto real (o item bruto da busca não traz isso)
     detalhes = await buscar_detalhes_jogo(session, appid)
     if not detalhes:
         return None
 
     # Excluir DLCs, trilhas sonoras etc — só jogos completos
     if detalhes.get("type") != "game":
+        return None
+
+    preco_info = detalhes.get("price_overview", {})
+    discount = preco_info.get("discount_percent", 0)
+    if discount < desconto_minimo:
         return None
 
     # Filtro indie
@@ -140,7 +141,6 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
     if avaliacao["percentual"] < nota_minima:
         return None
 
-    preco_info = detalhes.get("price_overview", {})
     preco_original = preco_info.get("initial", 0) / 100
     preco_final = preco_info.get("final", 0) / 100
 
@@ -193,7 +193,7 @@ async def buscar_promocoes_steam(
             return []
 
         # 2. Processar cada jogo em paralelo (com limite de concorrência)
-        semaforo = asyncio.Semaphore(8)
+        semaforo = asyncio.Semaphore(12)
 
         async def processar_com_limite(item):
             async with semaforo:
@@ -513,7 +513,17 @@ async def cmd_debug(ctx):
                         if items:
                             linhas.append(f"   Exemplo: `{items[0].get('name', '???')}` (appid {items[0].get('id')})")
                             linhas.append(f"   Chaves disponíveis: `{list(items[0].keys())}`")
-                            linhas.append(f"   Item bruto: `{str(items[0])[:500]}`")
+
+                            # Testar o processamento completo (extração de appid + appdetails + desconto)
+                            resultado_proc = await processar_jogo(session, items[0], 0, 0, False)
+                            if resultado_proc:
+                                linhas.append(
+                                    f"   ✅ Processamento OK: `{resultado_proc['nome']}` "
+                                    f"desconto=`{resultado_proc['desconto']}%` "
+                                    f"nota=`{resultado_proc['avaliacao_percentual']}%`"
+                                )
+                            else:
+                                linhas.append(f"   ⚠️ processar_jogo() retornou None para este item (com filtros zerados)")
                         else:
                             linhas.append(f"   Corpo bruto (primeiros 300 chars): `{texto[:300]}`")
                     except Exception as e:
