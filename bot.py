@@ -44,6 +44,7 @@ async def buscar_pagina_busca(session: aiohttp.ClientSession, start: int, count:
         "cc": "br",
         "l": "portuguese",
         "category1": 998,       # 998 = Jogos (exclui software, DLC solto etc.)
+        "json": 1,               # ESSENCIAL: sem isso a Steam devolve a página HTML, não o JSON
     }
     try:
         async with session.get(STEAM_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -456,14 +457,17 @@ async def cmd_ir(ctx, numero: int):
 async def cmd_notaminima(ctx, valor: int = None):
     """Exibe ou altera a nota mínima de avaliação (só nesta sessão)."""
     global NOTA_MINIMA
-    if valor is None:
-        await ctx.send(f"⭐ Nota mínima atual: **{NOTA_MINIMA}%** de avaliações positivas.")
-        return
-    if valor < 0 or valor > 100:
-        await ctx.send("❌ A nota deve ser entre 0 e 100.")
-        return
-    NOTA_MINIMA = valor
-    await ctx.send(f"✅ Nota mínima ajustada para **{valor}%**. Use `!promocoes` para buscar novamente.")
+    try:
+        if valor is None:
+            await ctx.send(f"⭐ Nota mínima atual: **{NOTA_MINIMA}%** de avaliações positivas.")
+            return
+        if valor < 0 or valor > 100:
+            await ctx.send("❌ A nota deve ser entre 0 e 100.")
+            return
+        NOTA_MINIMA = valor
+        await ctx.send(f"✅ Nota mínima ajustada para **{valor}%**. Use `!promocoes` para buscar novamente.")
+    except Exception as e:
+        await ctx.send(f"❌ Erro ao processar o comando: `{e}`")
 
 
 @bot.command(name="debug")
@@ -489,6 +493,7 @@ async def cmd_debug(ctx):
                 "cc": "br",
                 "l": "portuguese",
                 "category1": 998,
+                "json": 1,
             }
             async with session.get(STEAM_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 texto = await resp.text()
