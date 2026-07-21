@@ -169,7 +169,12 @@ async def buscar_promocoes_steam(
     """
     resultados_brutos = []
 
-    async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+    async with aiohttp.ClientSession(headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Referer": "https://store.steampowered.com/search/?specials=1",
+    }) as session:
         # 1. Paginar pelo endpoint de busca para pegar MUITO mais jogos em promoção
         for pagina in range(max_paginas):
             start = pagina * 50
@@ -465,7 +470,82 @@ async def cmd_notaminima(ctx, valor: int = None):
     await ctx.send(f"✅ Nota mínima ajustada para **{valor}%**. Use `!promocoes` para buscar novamente.")
 
 
-@bot.command(name="ajuda", aliases=["help", "comandos"])
+@bot.command(name="debug")
+async def cmd_debug(ctx):
+    """Testa cada etapa da busca isoladamente para descobrir onde está travando."""
+    msg = await ctx.send("🔧 Rodando diagnóstico, aguarde...")
+    linhas = []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Referer": "https://store.steampowered.com/search/?specials=1",
+    }
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        # 1. Testar endpoint de busca (specials)
+        try:
+            params = {
+                "query": "", "start": 0, "count": 10, "dynamic_data": "",
+                "sort_by": "_ASC", "specials": 1, "hidef2p": 0,
+                "cc": "br", "l": "portuguese", "infinite": 1,
+            }
+            async with session.get(STEAM_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                texto = await resp.text()
+                linhas.append(f"**1. Busca de promoções** → status HTTP `{resp.status}`")
+                if resp.status == 200:
+                    try:
+                        data = await resp.json(content_type=None)
+                        items = data.get("items", [])
+                        linhas.append(f"   ✅ JSON válido, `{len(items)}` jogos recebidos")
+                        if items:
+                            linhas.append(f"   Exemplo: `{items[0].get('name', '???')}` (appid {items[0].get('id')})")
+                    except Exception as e:
+                        linhas.append(f"   ❌ Resposta não é JSON válido: {e}")
+                        linhas.append(f"   Início da resposta: `{texto[:150]}`")
+                else:
+                    linhas.append(f"   ❌ Corpo da resposta: `{texto[:200]}`")
+        except Exception as e:
+            linhas.append(f"**1. Busca de promoções** → ❌ Exceção: `{e}`")
+
+        # 2. Testar appdetails com um appid conhecido (Counter-Strike 2 = 730)
+        try:
+            params2 = {"appids": 730, "cc": "br", "l": "portuguese", "filters": "price_overview,genres,name,type"}
+            async with session.get(STEAM_APPDETAILS_URL, params=params2, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                linhas.append(f"\n**2. Detalhes de jogo (appdetails)** → status HTTP `{resp.status}`")
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    entry = data.get("730", {})
+                    linhas.append(f"   success: `{entry.get('success')}`")
+                else:
+                    texto2 = await resp.text()
+                    linhas.append(f"   ❌ Corpo: `{texto2[:200]}`")
+        except Exception as e:
+            linhas.append(f"\n**2. Detalhes de jogo** → ❌ Exceção: `{e}`")
+
+        # 3. Testar avaliações do mesmo jogo
+        try:
+            params3 = {"json": 1, "language": "all", "purchase_type": "all", "num_per_page": 0}
+            async with session.get(STEAM_REVIEWS_URL.format(appid=730), params=params3, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                linhas.append(f"\n**3. Avaliações (appreviews)** → status HTTP `{resp.status}`")
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    summary = data.get("query_summary", {})
+                    linhas.append(f"   total_reviews: `{summary.get('total_reviews')}`")
+        except Exception as e:
+            linhas.append(f"\n**3. Avaliações** → ❌ Exceção: `{e}`")
+
+    embed = discord.Embed(
+        title="🔧 Diagnóstico da API da Steam",
+        description="\n".join(linhas)[:4000],
+        color=discord.Color.orange(),
+    )
+    await msg.delete()
+    await ctx.send(embed=embed)
+
+
+
 async def cmd_ajuda(ctx):
     embed = discord.Embed(
         title="🤖 Comandos do Bot de Promoções Steam",
