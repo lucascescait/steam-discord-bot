@@ -105,7 +105,13 @@ async def buscar_avaliacao(session: aiohttp.ClientSession, appid: int) -> dict |
 async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_minimo: int,
                           nota_minima: int, excluir_indie: bool) -> dict | None:
     """Processa um item bruto da busca: pega detalhes + avaliação, aplica filtros."""
-    appid = item.get("id")
+    appid = item.get("id") or item.get("appid")
+    # Fallback: às vezes o appid vem dentro de um atributo data-ds-appid ou logo/capsule url
+    if not appid and item.get("logo"):
+        import re
+        m = re.search(r"/apps/(\d+)/", item.get("logo", ""))
+        if m:
+            appid = int(m.group(1))
     if not appid:
         return None
 
@@ -506,6 +512,8 @@ async def cmd_debug(ctx):
                         linhas.append(f"   ✅ JSON válido, `{len(items)}` jogos recebidos (total_count: `{total_count}`)")
                         if items:
                             linhas.append(f"   Exemplo: `{items[0].get('name', '???')}` (appid {items[0].get('id')})")
+                            linhas.append(f"   Chaves disponíveis: `{list(items[0].keys())}`")
+                            linhas.append(f"   Item bruto: `{str(items[0])[:500]}`")
                         else:
                             linhas.append(f"   Corpo bruto (primeiros 300 chars): `{texto[:300]}`")
                     except Exception as e:
