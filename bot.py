@@ -38,23 +38,19 @@ GENRE_INDIE = "Indie"
 async def buscar_pagina_busca(session: aiohttp.ClientSession, start: int, count: int = 50) -> list[dict]:
     """Busca uma página de resultados de promoções direto do endpoint de busca da Steam."""
     params = {
-        "query": "",
         "start": start,
         "count": count,
-        "dynamic_data": "",
-        "sort_by": "_ASC",
         "specials": 1,          # apenas jogos em promoção
-        "hidef2p": 0,
         "cc": "br",
         "l": "portuguese",
-        "infinite": 1,
+        "category1": 998,       # 998 = Jogos (exclui software, DLC solto etc.)
     }
     try:
         async with session.get(STEAM_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
                 print(f"[AVISO] Steam retornou status {resp.status} na página start={start}")
                 return []
-            data = await resp.json()
+            data = await resp.json(content_type=None)
             items = data.get("items", []) if isinstance(data, dict) else []
             print(f"[INFO] Página start={start}: {len(items)} jogos recebidos")
             return items
@@ -71,7 +67,7 @@ async def buscar_detalhes_jogo(session: aiohttp.ClientSession, appid: int) -> di
         async with session.get(STEAM_APPDETAILS_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 return None
-            data = await resp.json()
+            data = await resp.json(content_type=None)
             entry = data.get(str(appid))
             if not entry or not entry.get("success"):
                 return None
@@ -89,7 +85,7 @@ async def buscar_avaliacao(session: aiohttp.ClientSession, appid: int) -> dict |
         ) as resp:
             if resp.status != 200:
                 return None
-            data = await resp.json()
+            data = await resp.json(content_type=None)
             summary = data.get("query_summary", {})
             total = summary.get("total_reviews", 0)
             positivas = summary.get("total_positive", 0)
@@ -487,9 +483,12 @@ async def cmd_debug(ctx):
         # 1. Testar endpoint de busca (specials)
         try:
             params = {
-                "query": "", "start": 0, "count": 10, "dynamic_data": "",
-                "sort_by": "_ASC", "specials": 1, "hidef2p": 0,
-                "cc": "br", "l": "portuguese", "infinite": 1,
+                "start": 0,
+                "count": 10,
+                "specials": 1,
+                "cc": "br",
+                "l": "portuguese",
+                "category1": 998,
             }
             async with session.get(STEAM_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 texto = await resp.text()
@@ -498,9 +497,12 @@ async def cmd_debug(ctx):
                     try:
                         data = await resp.json(content_type=None)
                         items = data.get("items", [])
-                        linhas.append(f"   ✅ JSON válido, `{len(items)}` jogos recebidos")
+                        total_count = data.get("total_count", "?")
+                        linhas.append(f"   ✅ JSON válido, `{len(items)}` jogos recebidos (total_count: `{total_count}`)")
                         if items:
                             linhas.append(f"   Exemplo: `{items[0].get('name', '???')}` (appid {items[0].get('id')})")
+                        else:
+                            linhas.append(f"   Corpo bruto (primeiros 300 chars): `{texto[:300]}`")
                     except Exception as e:
                         linhas.append(f"   ❌ Resposta não é JSON válido: {e}")
                         linhas.append(f"   Início da resposta: `{texto[:150]}`")
