@@ -16,6 +16,7 @@ DESCONTO_MINIMO = int(os.getenv("DESCONTO_MINIMO", "50"))
 INTERVALO_HORAS = int(os.getenv("INTERVALO_HORAS", "6"))
 NOTA_MINIMA = int(os.getenv("NOTA_MINIMA", "70"))       # % mínimo de avaliações positivas
 EXCLUIR_INDIE = os.getenv("EXCLUIR_INDIE", "true").lower() == "true"
+ITAD_API_KEY = os.getenv("ITAD_API_KEY", "")            # chave gratuita: isthereanydeal.com/apps/my/
 JOGOS_POR_PAGINA = 10
 
 jogos_enviados = set()
@@ -29,6 +30,9 @@ STEAM_SEARCH_URL = "https://store.steampowered.com/search/results/"
 STEAM_APPDETAILS_URL = "https://store.steampowered.com/api/appdetails"
 STEAM_REVIEWS_URL = "https://store.steampowered.com/appreviews/{appid}"
 STEAM_APP_URL = "https://store.steampowered.com/app/{appid}"
+
+ITAD_LOOKUP_URL = "https://api.isthereanydeal.com/games/lookup/v1"
+ITAD_PRICES_URL = "https://api.isthereanydeal.com/games/prices/v3"
 
 # categoria Steam para "Indie" = category id 492 (genre) — vamos checar pelas genres do appdetails
 GENRE_INDIE = "Indie"
@@ -98,6 +102,61 @@ async def buscar_avaliacao(session: aiohttp.ClientSession, appid: int) -> dict |
                 "percentual": percentual,
                 "total": total,
                 "descricao": summary.get("review_score_desc", ""),
+            }
+    except Exception:
+        return None
+
+
+# ─── IsThereAnyDeal (ITAD) — preço mínimo histórico ───────────────────────────
+# API oficial e gratuita: https://docs.isthereanydeal.com/
+# Chave grátis em: https://isthereanydeal.com/apps/my/
+async def buscar_itad_game_id(session: aiohttp.ClientSession, appid: int) -> str | None:
+    """Traduz um Steam appid para o ID interno do ITAD."""
+    if not ITAD_API_KEY:
+        return None
+    params = {"key": ITAD_API_KEY, "appid": appid}
+    try:
+        async with session.get(ITAD_LOOKUP_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+            if not data.get("found"):
+                return None
+            return data.get("game", {}).get("id")
+    except Exception:
+        return None
+
+
+async def buscar_preco_minimo_historico(session: aiohttp.ClientSession, itad_game_id: str) -> dict | None:
+    """Busca o preço mínimo histórico (all-time) em BRL e a data da promoção que gerou esse preço."""
+    if not ITAD_API_KEY or not itad_game_id:
+        return None
+    params = {"key": ITAD_API_KEY, "country": "BR"}
+    try:
+        async with session.post(
+            ITAD_PRICES_URL, params=params, json=[itad_game_id], timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+            if not data:
+                return None
+            entry = data[0]
+            history_low = entry.get("historyLow", {}).get("all")
+            if not history_low:
+                return None
+
+            # O endpoint de preços não traz a data exata do menor histórico —
+            # usamos a data do deal atual da Steam como referência mais próxima disponível.
+            data_promocao = None
+            for deal in entry.get("deals", []):
+                if deal.get("shop", {}).get("name") == "Steam":
+                    data_promocao = deal.get("timestamp")
+                    break
+
+            return {
+                "preco_minimo": history_low.get("amount", 0),
+                "data_promocao": data_promocao,
             }
     except Exception:
         return None
@@ -185,12 +244,24 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
     preco_original = preco_info.get("initial", 0) / 100
     preco_final = preco_info.get("final", 0) / 100
 
+    # Preço mínimo histórico (via ITAD) — opcional, só roda se ITAD_API_KEY estiver configurada
+    preco_minimo_historico = None
+    data_promocao_historica = None
+    itad_id = await buscar_itad_game_id(session, appid)
+    if itad_id:
+        historico = await buscar_preco_minimo_historico(session, itad_id)
+        if historico:
+            preco_minimo_historico = historico.get("preco_minimo")
+            data_promocao_historica = historico.get("data_promocao")
+
     return {
         "appid": appid,
         "nome": detalhes.get("name", item.get("name", "Desconhecido")),
         "desconto": discount,
         "preco_original": preco_original,
         "preco_final": preco_final,
+        "preco_minimo_historico": preco_minimo_historico,
+        "data_promocao_historica": data_promocao_historica,
         "imagem": detalhes.get("header_image", ""),
         "url": STEAM_APP_URL.format(appid=appid),
         "generos": generos,
@@ -234,7 +305,7 @@ async def buscar_promocoes_steam(
             return []
 
         # 2. Processar cada jogo em paralelo (com limite de concorrência)
-        semaforo = asyncio.Semaphore(12)
+        semaforo = asyncio.Semaphore(15)
 
         async def processar_com_limite(item):
             async with semaforo:
@@ -305,6 +376,28 @@ def criar_embed_jogo(jogo: dict, indice: int, total: int) -> discord.Embed:
         embed.add_field(name="📉 Desconto", value=f"**-{desconto}%**\n(economia {formatar_real(economia)})", inline=True)
     else:
         embed.add_field(name="💰 Preço", value="**GRÁTIS!** 🎉", inline=False)
+
+    # Preço mínimo histórico (via IsThereAnyDeal, se configurado)
+    preco_min = jogo.get("preco_minimo_historico")
+    if preco_min is not None:
+        preco_atual = jogo["preco_final"]
+        if preco_atual <= preco_min + 0.01:  # margem pra arredondamento
+            comparacao = "🏆 **Esse é o menor preço histórico!**"
+        else:
+            diferenca = preco_atual - preco_min
+            comparacao = f"Já esteve **{formatar_real(diferenca)}** mais barato"
+
+        valor_historico = f"**{formatar_real(preco_min)}**\n{comparacao}"
+
+        data_promo = jogo.get("data_promocao_historica")
+        if data_promo:
+            try:
+                dt = datetime.fromisoformat(data_promo.replace("Z", "+00:00"))
+                valor_historico += f"\n📅 Última promoção: {dt.strftime('%d/%m/%Y')}"
+            except Exception:
+                pass
+
+        embed.add_field(name="📊 Menor Preço Histórico", value=valor_historico, inline=False)
 
     emoji_nota = emoji_avaliacao(jogo["avaliacao_percentual"])
     embed.add_field(
@@ -454,9 +547,10 @@ async def cmd_promocoes(ctx, desconto: int = None):
         await ctx.send("❌ O desconto deve ser entre 1% e 99%.")
         return
 
+    tempo_estimado = "1 minuto" if ITAD_API_KEY else "30 segundos"
     msg_espera = await ctx.send(
         f"🔍 Buscando promoções na Steam com -{desc}% ou mais, nota ≥{NOTA_MINIMA}%, sem indies...\n"
-        f"⏳ Isso pode levar até 30 segundos (estamos vasculhando várias páginas!)"
+        f"⏳ Isso pode levar até {tempo_estimado} (estamos vasculhando várias páginas!)"
     )
 
     jogos = await buscar_promocoes_steam(desc, NOTA_MINIMA, EXCLUIR_INDIE)
@@ -651,6 +745,11 @@ async def cmd_config(ctx):
     embed.add_field(name="⭐ Nota Mínima", value=f"{NOTA_MINIMA}%", inline=True)
     embed.add_field(name="🚫 Excluir Indies", value="Sim" if EXCLUIR_INDIE else "Não", inline=True)
     embed.add_field(name="⏱️ Intervalo", value=f"a cada {INTERVALO_HORAS}h", inline=True)
+    embed.add_field(
+        name="📊 Preço Mínimo Histórico (ITAD)",
+        value="✅ Ativado" if ITAD_API_KEY else "⚠️ Desativado (configure ITAD_API_KEY)",
+        inline=True,
+    )
     embed.add_field(name="🔄 Próxima Verificação", value=proxima_str, inline=False)
     await ctx.send(embed=embed)
 
