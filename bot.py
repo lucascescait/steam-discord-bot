@@ -508,7 +508,7 @@ def criar_embed_jogo(jogo: dict, indice: int, total: int) -> discord.Embed:
     if jogo.get("imagem"):
         embed.set_image(url=jogo["imagem"])
 
-    embed.set_footer(text=f"Steam BR • Jogo {indice} de {total} • Página")
+    embed.set_footer(text=f"Steam BR • Jogo {indice} de {total} • Expira após 5 min sem interação")
     return embed
 
 
@@ -517,10 +517,11 @@ class PaginacaoView(View):
     """View com botões para navegar entre os jogos em promoção, um por vez."""
 
     def __init__(self, jogos: list[dict], autor_id: int, pagina_atual: int = 0):
-        super().__init__(timeout=180)  # expira após 3 min de inatividade
+        super().__init__(timeout=300)  # expira após 5 min de inatividade
         self.jogos = jogos
         self.autor_id = autor_id
         self.pagina_atual = pagina_atual
+        self.mensagem: discord.Message | None = None
         self._atualizar_botoes()
 
     def _atualizar_botoes(self):
@@ -537,8 +538,12 @@ class PaginacaoView(View):
         return True
 
     async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
+        if not self.mensagem:
+            return
+        try:
+            await self.mensagem.delete()
+        except discord.HTTPException as erro:
+            print(f"[AVISO] Não foi possível apagar uma paginação expirada: {erro}")
 
     @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary)
     async def anterior(self, interaction: discord.Interaction, button: Button):
@@ -647,7 +652,7 @@ async def verificar_promocoes():
     await canal.send(embed=embed_resumo)
     if novos:
         primeiro_embed = criar_embed_jogo(novos[0], 1, len(novos))
-        await canal.send(embed=primeiro_embed, view=view)
+        view.mensagem = await canal.send(embed=primeiro_embed, view=view)
 
     for jogo in novos:
         jogos_enviados.add(jogo["appid"])
@@ -697,7 +702,7 @@ async def cmd_promocoes(ctx, desconto: int = None):
 
     view = PaginacaoView(jogos, autor_id=ctx.author.id)
     embed_primeiro = criar_embed_jogo(jogos[0], 1, len(jogos))
-    await ctx.send(embed=embed_primeiro, view=view)
+    view.mensagem = await ctx.send(embed=embed_primeiro, view=view)
 
 
 @bot.command(name="promocao", aliases=["pesquisar", "busca"])
@@ -719,7 +724,7 @@ async def cmd_promocao(ctx, *, termo: str):
     ultima_busca[ctx.author.id] = jogos
     await ctx.send(embed=criar_embed_resultados_busca(termo, jogos))
     view = PaginacaoView(jogos, autor_id=ctx.author.id)
-    await ctx.send(embed=criar_embed_jogo(jogos[0], 1, len(jogos)), view=view)
+    view.mensagem = await ctx.send(embed=criar_embed_jogo(jogos[0], 1, len(jogos)), view=view)
 
 
 @bot.command(name="ir")
@@ -735,7 +740,7 @@ async def cmd_ir(ctx, numero: int):
 
     view = PaginacaoView(jogos, autor_id=ctx.author.id, pagina_atual=numero - 1)
     embed = criar_embed_jogo(jogos[numero - 1], numero, len(jogos))
-    await ctx.send(embed=embed, view=view)
+    view.mensagem = await ctx.send(embed=embed, view=view)
 
 
 @bot.command(name="notaminima")
