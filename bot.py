@@ -670,7 +670,8 @@ async def cmd_promocoes(ctx, desconto: int = None):
 
     tempo_estimado = "1 minuto" if ITAD_API_KEY else "30 segundos"
     msg_espera = await ctx.send(
-        f"🔍 Buscando promoções na Steam com -{desc}% ou mais, nota ≥{NOTA_MINIMA}%, sem indies...\n"
+        f"🔍 Buscando promoções na Steam com -{desc}% ou mais, nota ≥{NOTA_MINIMA}%"
+        f"{', sem indies' if EXCLUIR_INDIE else ', incluindo indies'}...\n"
         f"⏳ Isso pode levar até {tempo_estimado} (estamos vasculhando várias páginas!)"
     )
 
@@ -752,6 +753,30 @@ async def cmd_notaminima(ctx, valor: int = None):
         await ctx.send(f"✅ Nota mínima ajustada para **{valor}%**. Use `!promocoes` para buscar novamente.")
     except Exception as e:
         await ctx.send(f"❌ Erro ao processar o comando: `{e}`")
+
+
+@bot.command(name="noindie")
+async def cmd_noindie(ctx, estado: str = None):
+    """Ativa o filtro de jogos indie; use 'off' para voltar a incluí-los."""
+    global EXCLUIR_INDIE
+
+    if estado is None:
+        EXCLUIR_INDIE = True
+        await ctx.send("🚫 Filtro de indies ativado. As próximas buscas com `!promocoes` não mostrarão jogos indie.")
+        return
+
+    estado = estado.casefold()
+    if estado in {"on", "sim", "true", "ativar"}:
+        EXCLUIR_INDIE = True
+        await ctx.send("🚫 Filtro de indies ativado.")
+    elif estado in {"off", "não", "nao", "false", "desativar"}:
+        EXCLUIR_INDIE = False
+        await ctx.send("✅ Jogos indie voltarão a aparecer nas próximas buscas com `!promocoes`.")
+    elif estado in {"status", "estado"}:
+        status = "ativado — indies serão excluídos" if EXCLUIR_INDIE else "desativado — indies serão incluídos"
+        await ctx.send(f"🚫 Filtro de indies: **{status}**.")
+    else:
+        await ctx.send("⚠️ Use `!noindie`, `!noindie on`, `!noindie off` ou `!noindie status`.")
 
 
 @bot.command(name="debug")
@@ -873,6 +898,11 @@ async def cmd_ajuda(ctx):
     embed.add_field(
         name="⭐ `!notaminima [valor]`",
         value="Vê ou ajusta a nota mínima de avaliação exigida (padrão 70%).",
+        inline=False,
+    )
+    embed.add_field(
+        name="🚫 `!noindie [on|off|status]`",
+        value="Exclui jogos indie das próximas buscas. Use sem argumento para ativar.",
         inline=False,
     )
     embed.add_field(name="⚙️ `!config`", value="Mostra as configurações atuais.", inline=False)
