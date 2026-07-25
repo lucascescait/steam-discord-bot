@@ -4,6 +4,7 @@ from discord.ui import View, Button
 import aiohttp
 import asyncio
 import os
+import unicodedata
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -18,6 +19,8 @@ NOTA_MINIMA = int(os.getenv("NOTA_MINIMA", "70"))       # % mínimo de avaliaç�
 EXCLUIR_INDIE = os.getenv("EXCLUIR_INDIE", "true").lower() == "true"
 ITAD_API_KEY = os.getenv("ITAD_API_KEY", "")            # chave gratuita: isthereanydeal.com/apps/my/
 JOGOS_POR_PAGINA = 10
+RESULTADOS_POR_PAGINA = 25  # A Steam limita esse endpoint a 25 itens por requisição.
+MAX_CONCORRENCIA_STEAM = 8
 
 jogos_enviados = set()
 
@@ -39,17 +42,47 @@ GENRE_INDIE = "Indie"
 
 
 # ─── Busca de promoções (com paginação real da Steam) ────────────────────────
-async def buscar_pagina_busca(session: aiohttp.ClientSession, start: int, count: int = 50) -> list[dict]:
+def extrair_appid(item: dict) -> int | None:
+    """Obtém o appid tanto das respostas novas quanto das respostas antigas da Steam."""
+    appid = item.get("id") or item.get("appid")
+    if appid:
+        try:
+            return int(appid)
+        except (TypeError, ValueError):
+            return None
+
+    logo = item.get("logo", "")
+    import re
+    match = re.search(r"/(?:apps|subs)/(\d+)/", logo)
+    return int(match.group(1)) if match else None
+
+
+def normalizar_texto(valor: str) -> str:
+    """Normaliza nomes para comparar buscas sem diferenças de acento ou caixa."""
+    sem_acento = unicodedata.normalize("NFKD", valor).encode("ASCII", "ignore").decode("ASCII")
+    return " ".join(sem_acento.casefold().split())
+
+
+async def buscar_pagina_busca(
+    session: aiohttp.ClientSession,
+    start: int,
+    count: int = RESULTADOS_POR_PAGINA,
+    termo: str | None = None,
+    apenas_promocoes: bool = True,
+) -> list[dict]:
     """Busca uma página de resultados de promoções direto do endpoint de busca da Steam."""
     params = {
         "start": start,
-        "count": count,
-        "specials": 1,          # apenas jogos em promoção
+        "count": min(count, RESULTADOS_POR_PAGINA),
         "cc": "br",
         "l": "portuguese",
         "category1": 998,       # 998 = Jogos (exclui software, DLC solto etc.)
         "json": 1,               # ESSENCIAL: sem isso a Steam devolve a página HTML, não o JSON
     }
+    if apenas_promocoes:
+        params["specials"] = 1
+    if termo:
+        params["term"] = termo
     try:
         async with session.get(STEAM_SEARCH_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
@@ -199,76 +232,64 @@ async def processar_jogo_debug(session: aiohttp.ClientSession, item: dict) -> st
     )
 
 
-async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_minimo: int,
-                          nota_minima: int, excluir_indie: bool) -> dict | None:
-    """Processa um item bruto da busca: pega detalhes + avaliação, aplica filtros."""
-    appid = item.get("id") or item.get("appid")
-    # Fallback: o item de busca só traz name+logo — o appid vem embutido na URL do logo
-    if not appid and item.get("logo"):
-        import re
-        m = re.search(r"/apps/(\d+)/", item.get("logo", ""))
-        if m:
-            appid = int(m.group(1))
+async def montar_jogo(session: aiohttp.ClientSession, item: dict) -> dict | None:
+    """Converte um resultado da busca em dados completos de um jogo da Steam."""
+    appid = extrair_appid(item)
     if not appid:
         return None
 
-    # Detalhes completos — inclusive o desconto real (o item bruto da busca não traz isso)
     detalhes = await buscar_detalhes_jogo(session, appid)
-    if not detalhes:
+    if not detalhes or detalhes.get("type") not in (None, "game"):
         return None
 
-    # Excluir DLCs, trilhas sonoras etc — só jogos completos
-    # (tolerante: só rejeita se vier um tipo explícito diferente de "game";
-    #  se o campo vier ausente/None, não descarta — é mais seguro que perder jogos válidos)
-    tipo_jogo = detalhes.get("type")
-    if tipo_jogo is not None and tipo_jogo != "game":
-        return None
-
-    preco_info = detalhes.get("price_overview", {})
-    discount = preco_info.get("discount_percent", 0)
-    if discount < desconto_minimo:
-        return None
-
-    # Filtro indie
-    generos = [g.get("description", "") for g in detalhes.get("genres", [])]
-    if excluir_indie and GENRE_INDIE in generos:
-        return None
-
-    # Avaliação
+    preco_info = detalhes.get("price_overview") or {}
     avaliacao = await buscar_avaliacao(session, appid)
-    if not avaliacao or avaliacao["total"] < 10:  # ignora jogos com poucas avaliações (dados não confiáveis)
-        return None
-    if avaliacao["percentual"] < nota_minima:
-        return None
-
-    preco_original = preco_info.get("initial", 0) / 100
-    preco_final = preco_info.get("final", 0) / 100
-
-    # Preço mínimo histórico (via ITAD) — opcional, só roda se ITAD_API_KEY estiver configurada
-    preco_minimo_historico = None
-    data_promocao_historica = None
-    itad_id = await buscar_itad_game_id(session, appid)
-    if itad_id:
-        historico = await buscar_preco_minimo_historico(session, itad_id)
-        if historico:
-            preco_minimo_historico = historico.get("preco_minimo")
-            data_promocao_historica = historico.get("data_promocao")
+    if not avaliacao:
+        avaliacao = {"percentual": 0, "total": 0, "descricao": "Sem avaliações"}
 
     return {
         "appid": appid,
         "nome": detalhes.get("name", item.get("name", "Desconhecido")),
-        "desconto": discount,
-        "preco_original": preco_original,
-        "preco_final": preco_final,
-        "preco_minimo_historico": preco_minimo_historico,
-        "data_promocao_historica": data_promocao_historica,
+        "desconto": preco_info.get("discount_percent", 0),
+        "preco_original": preco_info.get("initial", 0) / 100,
+        "preco_final": preco_info.get("final", 0) / 100,
+        "preco_minimo_historico": None,
+        "data_promocao_historica": None,
         "imagem": detalhes.get("header_image", ""),
         "url": STEAM_APP_URL.format(appid=appid),
-        "generos": generos,
+        "generos": [g.get("description", "") for g in detalhes.get("genres", [])],
         "avaliacao_percentual": avaliacao["percentual"],
         "avaliacao_total": avaliacao["total"],
         "avaliacao_desc": avaliacao["descricao"],
     }
+
+
+async def adicionar_historico(session: aiohttp.ClientSession, jogo: dict) -> None:
+    """Acrescenta o menor preço do ITAD somente aos resultados que serão exibidos."""
+    if not ITAD_API_KEY:
+        return
+    itad_id = await buscar_itad_game_id(session, jogo["appid"])
+    if not itad_id:
+        return
+    historico = await buscar_preco_minimo_historico(session, itad_id)
+    if historico:
+        jogo["preco_minimo_historico"] = historico.get("preco_minimo")
+        jogo["data_promocao_historica"] = historico.get("data_promocao")
+
+
+async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_minimo: int,
+                          nota_minima: int, excluir_indie: bool) -> dict | None:
+    """Processa e filtra um jogo sem fazer chamadas extras ao ITAD para descartados."""
+    jogo = await montar_jogo(session, item)
+    if not jogo:
+        return None
+    if jogo["desconto"] < desconto_minimo:
+        return None
+    if excluir_indie and GENRE_INDIE in jogo["generos"]:
+        return None
+    if jogo["avaliacao_total"] < 10 or jogo["avaliacao_percentual"] < nota_minima:
+        return None
+    return jogo
 
 
 async def buscar_promocoes_steam(
@@ -292,26 +313,36 @@ async def buscar_promocoes_steam(
     }) as session:
         # 1. Paginar pelo endpoint de busca para pegar MUITO mais jogos em promoção
         for pagina in range(max_paginas):
-            start = pagina * 50
-            items = await buscar_pagina_busca(session, start=start, count=50)
+            start = pagina * RESULTADOS_POR_PAGINA
+            items = await buscar_pagina_busca(session, start=start)
             if not items:
                 break
             resultados_brutos.extend(items)
-            if len(resultados_brutos) >= 300:  # limite de segurança
+            if len(resultados_brutos) >= max_paginas * RESULTADOS_POR_PAGINA:
                 break
             await asyncio.sleep(0.3)  # não martelar a API da Steam
 
         if not resultados_brutos:
             return []
 
-        # 2. Processar cada jogo em paralelo (com limite de concorrência)
-        semaforo = asyncio.Semaphore(15)
+        # 2. A Steam limita a busca a 25 itens. Não pule páginas e não faça
+        # centenas de requisições simultâneas, pois isso costuma gerar 429.
+        itens_unicos = []
+        appids_vistos = set()
+        for item in resultados_brutos:
+            appid = extrair_appid(item)
+            if appid and appid not in appids_vistos:
+                appids_vistos.add(appid)
+                itens_unicos.append(item)
+
+        # 3. Processar cada jogo em paralelo, respeitando um limite seguro.
+        semaforo = asyncio.Semaphore(MAX_CONCORRENCIA_STEAM)
 
         async def processar_com_limite(item):
             async with semaforo:
                 return await processar_jogo(session, item, desconto_minimo, nota_minima, excluir_indie)
 
-        tarefas = [processar_com_limite(item) for item in resultados_brutos]
+        tarefas = [processar_com_limite(item) for item in itens_unicos]
         processados = await asyncio.gather(*tarefas)
 
     jogos_validos = [j for j in processados if j is not None]
@@ -327,7 +358,70 @@ async def buscar_promocoes_steam(
     # Ordenar por: nota de avaliação (desc), depois por desconto (desc)
     resultado_final.sort(key=lambda x: (x["avaliacao_percentual"], x["desconto"]), reverse=True)
 
-    return resultado_final[:max_resultados]
+    resultado_final = resultado_final[:max_resultados]
+
+    # O histórico é opcional e caro: consulte-o apenas para jogos aprovados,
+    # nunca para todos os candidatos que serão descartados pelos filtros.
+    if ITAD_API_KEY:
+        semaforo_itad = asyncio.Semaphore(3)
+
+        async def enriquecer_com_limite(itad_session: aiohttp.ClientSession, jogo: dict) -> None:
+            async with semaforo_itad:
+                await adicionar_historico(itad_session, jogo)
+
+        # A sessão Steam já foi fechada; abra uma sessão curta só para o ITAD.
+        async with aiohttp.ClientSession() as itad_session:
+            await asyncio.gather(*(enriquecer_com_limite(itad_session, jogo) for jogo in resultado_final))
+
+    return resultado_final
+
+
+async def buscar_jogos_por_termo(termo: str, max_resultados: int = 10) -> list[dict]:
+    """Faz uma busca normal por título na Steam, sem exigir que esteja em promoção."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+        "Referer": "https://store.steampowered.com/search/",
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        itens = await buscar_pagina_busca(
+            session,
+            start=0,
+            count=RESULTADOS_POR_PAGINA,
+            termo=termo,
+            apenas_promocoes=False,
+        )
+        if not itens:
+            return []
+
+        termo_normalizado = normalizar_texto(termo)
+        itens = sorted(
+            itens,
+            key=lambda item: (
+                normalizar_texto(item.get("name", "")) != termo_normalizado,
+                not normalizar_texto(item.get("name", "")).startswith(termo_normalizado),
+            ),
+        )
+
+        itens_unicos = []
+        appids_vistos = set()
+        for item in itens:
+            appid = extrair_appid(item)
+            if appid and appid not in appids_vistos:
+                appids_vistos.add(appid)
+                itens_unicos.append(item)
+            if len(itens_unicos) >= max_resultados:
+                break
+
+        semaforo = asyncio.Semaphore(MAX_CONCORRENCIA_STEAM)
+
+        async def montar_com_limite(item: dict) -> dict | None:
+            async with semaforo:
+                return await montar_jogo(session, item)
+
+        jogos = await asyncio.gather(*(montar_com_limite(item) for item in itens_unicos))
+    return [jogo for jogo in jogos if jogo is not None]
 
 
 # ─── Formatação ───────────────────────────────────────────────────────────────
@@ -369,11 +463,13 @@ def criar_embed_jogo(jogo: dict, indice: int, total: int) -> discord.Embed:
         timestamp=datetime.utcnow(),
     )
 
-    if jogo["preco_original"] > 0:
+    if jogo["preco_original"] > 0 and desconto > 0:
         embed.add_field(name="💰 Preço Original", value=f"~~{formatar_real(jogo['preco_original'])}~~", inline=True)
         embed.add_field(name="✅ Com Desconto", value=f"**{formatar_real(jogo['preco_final'])}**", inline=True)
         economia = jogo["preco_original"] - jogo["preco_final"]
         embed.add_field(name="📉 Desconto", value=f"**-{desconto}%**\n(economia {formatar_real(economia)})", inline=True)
+    elif jogo["preco_final"] > 0:
+        embed.add_field(name="💰 Preço Atual", value=f"**{formatar_real(jogo['preco_final'])}**", inline=False)
     else:
         embed.add_field(name="💰 Preço", value="**GRÁTIS!** 🎉", inline=False)
 
@@ -434,7 +530,7 @@ class PaginacaoView(View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.autor_id:
             await interaction.response.send_message(
-                "❌ Apenas quem pediu a busca pode navegar. Use `!promocoes` para fazer a sua própria busca!",
+                "❌ Apenas quem pediu a busca pode navegar. Use `!promocoes` ou `!promocao <jogo>` para fazer a sua própria busca!",
                 ephemeral=True,
             )
             return False
@@ -490,6 +586,31 @@ def criar_embed_resumo(jogos: list[dict]) -> discord.Embed:
         )
 
     embed.set_footer(text=f"Steam BR • {len(jogos)} jogos no total • Use os botões abaixo para navegar um por um")
+    return embed
+
+
+def criar_embed_resultados_busca(termo: str, jogos: list[dict]) -> discord.Embed:
+    """Monta um resumo neutro para a pesquisa por título."""
+    embed = discord.Embed(
+        title=f"🔎 Resultados para: {termo}",
+        description=f"**{len(jogos)} jogo(s)** encontrado(s) na Steam BR.",
+        color=discord.Color.from_rgb(23, 153, 232),
+        timestamp=datetime.utcnow(),
+    )
+    for indice, jogo in enumerate(jogos, start=1):
+        preco = formatar_real(jogo["preco_final"]) if jogo["preco_final"] > 0 else "GRÁTIS"
+        promocao = f" • **-{jogo['desconto']}%**" if jogo["desconto"] else " • sem promoção agora"
+        nota = (
+            f"{emoji_avaliacao(jogo['avaliacao_percentual'])} {jogo['avaliacao_percentual']}% positivas"
+            if jogo["avaliacao_total"]
+            else "Sem avaliações"
+        )
+        embed.add_field(
+            name=f"{indice}. {jogo['nome'][:60]}",
+            value=f"**{preco}**{promocao}\n{nota}\n[Ver na Steam]({jogo['url']})",
+            inline=False,
+        )
+    embed.set_footer(text="Steam BR • Use os botões ou !ir <número> para abrir um resultado")
     return embed
 
 
@@ -578,12 +699,34 @@ async def cmd_promocoes(ctx, desconto: int = None):
     await ctx.send(embed=embed_primeiro, view=view)
 
 
+@bot.command(name="promocao", aliases=["pesquisar", "busca"])
+async def cmd_promocao(ctx, *, termo: str):
+    """Pesquisa um jogo pelo nome e mostra seu preço atual e eventual promoção."""
+    termo = termo.strip()
+    if len(termo) < 2:
+        await ctx.send("⚠️ Informe pelo menos duas letras. Exemplo: `!promocao Hades`.")
+        return
+
+    msg_espera = await ctx.send(f"🔎 Pesquisando **{termo}** na Steam BR...")
+    jogos = await buscar_jogos_por_termo(termo)
+    await msg_espera.delete()
+
+    if not jogos:
+        await ctx.send(f"😕 Não encontrei jogos para **{termo}**. Tente outro título.")
+        return
+
+    ultima_busca[ctx.author.id] = jogos
+    await ctx.send(embed=criar_embed_resultados_busca(termo, jogos))
+    view = PaginacaoView(jogos, autor_id=ctx.author.id)
+    await ctx.send(embed=criar_embed_jogo(jogos[0], 1, len(jogos)), view=view)
+
+
 @bot.command(name="ir")
 async def cmd_ir(ctx, numero: int):
     """Pula direto para um jogo específico da última busca feita."""
     jogos = ultima_busca.get(ctx.author.id)
     if not jogos:
-        await ctx.send("❌ Você ainda não fez nenhuma busca. Use `!promocoes` primeiro.")
+        await ctx.send("❌ Você ainda não fez nenhuma busca. Use `!promocoes` ou `!promocao <jogo>` primeiro.")
         return
     if numero < 1 or numero > len(jogos):
         await ctx.send(f"❌ Escolha um número entre 1 e {len(jogos)}.")
@@ -704,6 +847,7 @@ async def cmd_debug(ctx):
 
 
 
+@bot.command(name="ajuda", aliases=["help", "comandos"])
 async def cmd_ajuda(ctx):
     embed = discord.Embed(
         title="🤖 Comandos do Bot de Promoções Steam",
@@ -714,6 +858,11 @@ async def cmd_ajuda(ctx):
         name="🔍 `!promocoes [desconto]`",
         value="Busca promoções (padrão -50% ou o valor que você passar).\n"
               "Mostra uma lista + navegação com botões ◀ ▶",
+        inline=False,
+    )
+    embed.add_field(
+        name="🎯 `!promocao <jogo>`",
+        value="Pesquisa um jogo pelo nome e mostra o preço atual e a promoção, se houver.",
         inline=False,
     )
     embed.add_field(
@@ -736,7 +885,9 @@ async def cmd_ajuda(ctx):
 async def cmd_config(ctx):
     canal = bot.get_channel(CANAL_ID)
     canal_nome = f"#{canal.name}" if canal else "❌ Não configurado"
-    proxima = verificar_promocoes.next_iteration
+    # Antes do on_ready a task ainda não foi iniciada; nesse estado
+    # next_iteration pode não existir em algumas versões do discord.py.
+    proxima = verificar_promocoes.next_iteration if verificar_promocoes.is_running() else None
     proxima_str = proxima.strftime("%d/%m/%Y às %H:%M UTC") if proxima else "Não agendado"
 
     embed = discord.Embed(title="⚙️ Configurações do Bot", color=discord.Color.blurple())
@@ -788,6 +939,11 @@ async def on_command_error(ctx, error):
         await ctx.send("⚠️ Argumento faltando. Use `!ajuda` para ver como usar o comando.")
     elif isinstance(error, commands.BadArgument):
         await ctx.send("⚠️ Argumento inválido — verifique se digitou um número corretamente.")
+    elif isinstance(error, commands.CommandInvokeError):
+        print(f"[ERRO] Comando {ctx.command}: {error.original}")
+        await ctx.send("❌ Ocorreu um erro ao executar esse comando. Tente novamente em alguns segundos.")
+    else:
+        print(f"[ERRO] Comando {ctx.command}: {error}")
 
 
 if __name__ == "__main__":
