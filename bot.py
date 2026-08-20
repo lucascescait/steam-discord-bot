@@ -75,8 +75,6 @@ async def buscar_pagina_busca(session: aiohttp.ClientSession, start: int, count:
 
 async def buscar_detalhes_jogo(session: aiohttp.ClientSession, appid: int) -> dict | None:
     """Busca detalhes completos (gêneros, preço, nota, imagem) de um jogo específico."""
-    # Sem 'filters' — esse parâmetro às vezes faz a Steam omitir até campos básicos como 'type'.
-    # Pegar a resposta completa é mais confiável (um pouco mais pesado, mas garante os campos certos).
     params = {"appids": appid, "cc": "br", "l": "portuguese"}
     try:
         async with session.get(STEAM_APPDETAILS_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -117,8 +115,6 @@ async def buscar_avaliacao(session: aiohttp.ClientSession, appid: int) -> dict |
 
 
 # ─── IsThereAnyDeal (ITAD) — preço mínimo histórico ───────────────────────────
-# API oficial e gratuita: https://docs.isthereanydeal.com/
-# Chave grátis em: https://isthereanydeal.com/apps/my/
 async def buscar_itad_game_id(session: aiohttp.ClientSession, appid: int) -> str | None:
     """Traduz um Steam appid para o ID interno do ITAD."""
     if not ITAD_API_KEY:
@@ -155,8 +151,6 @@ async def buscar_preco_minimo_historico(session: aiohttp.ClientSession, itad_gam
             if not history_low:
                 return None
 
-            # O endpoint de preços não traz a data exata do menor histórico —
-            # usamos a data do deal atual da Steam como referência mais próxima disponível.
             data_promocao = None
             for deal in entry.get("deals", []):
                 if deal.get("shop", {}).get("name") == "Steam":
@@ -212,7 +206,6 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
                           nota_minima: int, excluir_indie: bool) -> dict | None:
     """Processa um item bruto da busca: pega detalhes + avaliação, aplica filtros."""
     appid = item.get("id") or item.get("appid")
-    # Fallback: o item de busca só traz name+logo — o appid vem embutido na URL do logo
     if not appid and item.get("logo"):
         import re
         m = re.search(r"/apps/(\d+)/", item.get("logo", ""))
@@ -221,14 +214,10 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
     if not appid:
         return None
 
-    # Detalhes completos — inclusive o desconto real (o item bruto da busca não traz isso)
     detalhes = await buscar_detalhes_jogo(session, appid)
     if not detalhes:
         return None
 
-    # Excluir DLCs, trilhas sonoras etc — só jogos completos
-    # (tolerante: só rejeita se vier um tipo explícito diferente de "game";
-    #  se o campo vier ausente/None, não descarta — é mais seguro que perder jogos válidos)
     tipo_jogo = detalhes.get("type")
     if tipo_jogo is not None and tipo_jogo != "game":
         return None
@@ -238,14 +227,12 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
     if discount < desconto_minimo:
         return None
 
-    # Filtro indie
     generos = [g.get("description", "") for g in detalhes.get("genres", [])]
     if excluir_indie and GENRE_INDIE in generos:
         return None
 
-    # Avaliação
     avaliacao = await buscar_avaliacao(session, appid)
-    if not avaliacao or avaliacao["total"] < 10:  # ignora jogos com poucas avaliações (dados não confiáveis)
+    if not avaliacao or avaliacao["total"] < 10:
         return None
     if avaliacao["percentual"] < nota_minima:
         return None
@@ -253,7 +240,6 @@ async def processar_jogo(session: aiohttp.ClientSession, item: dict, desconto_mi
     preco_original = preco_info.get("initial", 0) / 100
     preco_final = preco_info.get("final", 0) / 100
 
-    # Preço mínimo histórico (via ITAD) — opcional, só roda se ITAD_API_KEY estiver configurada
     preco_minimo_historico = None
     data_promocao_historica = None
     itad_id = await buscar_itad_game_id(session, appid)
@@ -299,21 +285,19 @@ async def buscar_promocoes_steam(
         "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
         "Referer": "https://store.steampowered.com/search/?specials=1",
     }) as session:
-        # 1. Paginar pelo endpoint de busca para pegar MUITO mais jogos em promoção
         for pagina in range(max_paginas):
             start = pagina * 50
             items = await buscar_pagina_busca(session, start=start, count=50)
             if not items:
                 break
             resultados_brutos.extend(items)
-            if len(resultados_brutos) >= 300:  # limite de segurança
+            if len(resultados_brutos) >= 300:
                 break
-            await asyncio.sleep(0.3)  # não martelar a API da Steam
+            await asyncio.sleep(0.3)
 
         if not resultados_brutos:
             return []
 
-        # 2. Processar cada jogo em paralelo (com limite de concorrência)
         semaforo = asyncio.Semaphore(15)
 
         async def processar_com_limite(item):
@@ -325,7 +309,6 @@ async def buscar_promocoes_steam(
 
     jogos_validos = [j for j in processados if j is not None]
 
-    # Remover duplicatas
     vistos = set()
     resultado_final = []
     for jogo in jogos_validos:
@@ -333,7 +316,6 @@ async def buscar_promocoes_steam(
             vistos.add(jogo["appid"])
             resultado_final.append(jogo)
 
-    # Ordenar por: nota de avaliação (desc), depois por desconto (desc)
     resultado_final.sort(key=lambda x: (x["avaliacao_percentual"], x["desconto"]), reverse=True)
 
     return resultado_final[:max_resultados]
@@ -386,11 +368,10 @@ def criar_embed_jogo(jogo: dict, indice: int, total: int) -> discord.Embed:
     else:
         embed.add_field(name="💰 Preço", value="**GRÁTIS!** 🎉", inline=False)
 
-    # Preço mínimo histórico (via IsThereAnyDeal, se configurado)
     preco_min = jogo.get("preco_minimo_historico")
     if preco_min is not None:
         preco_atual = jogo["preco_final"]
-        if preco_atual <= preco_min + 0.01:  # margem pra arredondamento
+        if preco_atual <= preco_min + 0.01:
             comparacao = "🏆 **Esse é o menor preço histórico!**"
         else:
             diferenca = preco_atual - preco_min
@@ -425,12 +406,11 @@ def criar_embed_jogo(jogo: dict, indice: int, total: int) -> discord.Embed:
     return embed
 
 
-# ─── View de paginação (botões) ───────────────────────────────────────────────
 class PaginacaoView(View):
     """View com botões para navegar entre os jogos em promoção, um por vez."""
 
     def __init__(self, jogos: list[dict], autor_id: int, pagina_atual: int = 0):
-        super().__init__(timeout=180)  # expira após 3 min de inatividade
+        super().__init__(timeout=180)
         self.jogos = jogos
         self.autor_id = autor_id
         self.pagina_atual = pagina_atual
@@ -503,8 +483,6 @@ def criar_embed_resumo(jogos: list[dict]) -> discord.Embed:
 
 
 # ─── Task automática ──────────────────────────────────────────────────────────
-
-
 def carregar_epic_enviados() -> set:
     """Carrega do disco os IDs dos jogos da Epic já anunciados, sobrevivendo a reinícios do bot."""
     try:
@@ -529,8 +507,6 @@ epic_jogos_enviados = carregar_epic_enviados()
 async def buscar_jogos_gratis_epic() -> list[dict]:
     """
     Busca os jogos GRÁTIS ATUAIS (não os futuros) na Epic Games Store.
-    Um jogo é considerado "grátis agora" quando tem um promotionalOffer ativo
-    com discountPercentage=0 (ou seja, 100% de desconto) no período de hoje.
     """
     params = {"locale": "pt-BR", "country": "BR", "allowCountries": "BR"}
     jogos_gratis = []
@@ -558,30 +534,26 @@ async def buscar_jogos_gratis_epic() -> list[dict]:
         for grupo in ofertas_ativas:
             for oferta in grupo.get("promotionalOffers", []):
                 desconto_pct = oferta.get("discountSetting", {}).get("discountPercentage")
-                if desconto_pct == 0:  # 0% do preço original = 100% de desconto = grátis
+                if desconto_pct == 0:
                     esta_gratis_agora = True
                     break
 
         if not esta_gratis_agora:
             continue
 
-        # Preço original, se disponível (pra mostrar "de R$ X por GRÁTIS")
         preco_info = jogo.get("price", {}).get("totalPrice", {})
         preco_original_centavos = preco_info.get("originalPrice", 0)
 
-        # Monta a URL da página do jogo na Epic Store
         product_slug = jogo.get("productSlug") or jogo.get("urlSlug") or ""
-        # productSlug às vezes vem com "/home" no final — remove pra URL ficar limpa
         product_slug = product_slug.replace("/home", "")
         url = f"https://store.epicgames.com/pt-BR/p/{product_slug}" if product_slug else "https://store.epicgames.com/pt-BR/free-games"
 
-        # Imagem: pega a primeira "OfferImageWide" ou "featuredMedia" disponível
         imagem = ""
         for img in jogo.get("keyImages", []):
             if img.get("type") in ("OfferImageWide", "featuredMedia", "Thumbnail"):
                 imagem = img.get("url", "")
                 if img.get("type") == "OfferImageWide":
-                    break  # prioriza essa, mas aceita as outras como fallback
+                    break
 
         jogos_gratis.append({
             "id": jogo.get("id"),
@@ -601,7 +573,7 @@ def criar_embed_epic(jogo: dict) -> discord.Embed:
         title=f"🎁 {jogo['nome']}",
         url=jogo["url"],
         description=jogo.get("descricao", "")[:200] or None,
-        color=discord.Color.from_rgb(255, 255, 255),  # branco, cor de marca da Epic
+        color=discord.Color.from_rgb(255, 255, 255),
         timestamp=datetime.utcnow(),
     )
     if jogo["preco_original"] > 0:
@@ -694,7 +666,6 @@ async def verificar_promocoes():
 
 
 # ─── Comandos ─────────────────────────────────────────────────────────────────
-# Guarda a última busca de cada usuário para o comando !ir funcionar
 ultima_busca: dict[int, list[dict]] = {}
 
 
@@ -784,7 +755,6 @@ async def cmd_debug(ctx):
     }
 
     async with aiohttp.ClientSession(headers=headers) as session:
-        # 1. Testar endpoint de busca (specials)
         try:
             params = {
                 "start": 0,
@@ -808,11 +778,9 @@ async def cmd_debug(ctx):
                             linhas.append(f"   Exemplo: `{items[0].get('name', '???')}` (appid {items[0].get('id')})")
                             linhas.append(f"   Chaves disponíveis: `{list(items[0].keys())}`")
 
-                            # Testar o processamento completo com diagnóstico detalhado por etapa
                             diagnostico = await processar_jogo_debug(session, items[0])
                             linhas.append(f"   {diagnostico}")
 
-                            # Testar também em mais 2 itens, caso o primeiro seja um caso raro
                             for i, outro_item in enumerate(items[1:3], start=2):
                                 diag2 = await processar_jogo_debug(session, outro_item)
                                 linhas.append(f"   Item {i} (`{outro_item.get('name', '?')}`): {diag2}")
@@ -826,7 +794,6 @@ async def cmd_debug(ctx):
         except Exception as e:
             linhas.append(f"**1. Busca de promoções** → ❌ Exceção: `{e}`")
 
-        # 2. Testar appdetails com um appid conhecido (Counter-Strike 2 = 730)
         try:
             params2 = {"appids": 730, "cc": "br", "l": "portuguese", "filters": "price_overview,genres,name,type"}
             async with session.get(STEAM_APPDETAILS_URL, params=params2, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -841,7 +808,6 @@ async def cmd_debug(ctx):
         except Exception as e:
             linhas.append(f"\n**2. Detalhes de jogo** → ❌ Exceção: `{e}`")
 
-        # 3. Testar avaliações do mesmo jogo
         try:
             params3 = {"json": 1, "language": "all", "purchase_type": "all", "num_per_page": 0}
             async with session.get(STEAM_REVIEWS_URL.format(appid=730), params=params3, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -860,7 +826,6 @@ async def cmd_debug(ctx):
     )
     await msg.delete()
     await ctx.send(embed=embed)
-
 
 
 @bot.command(name="ajuda", aliases=["help", "comandos"])
@@ -1003,10 +968,46 @@ async def on_command_error(ctx, error):
         await ctx.send("⚠️ Argumento inválido — verifique se digitou um número corretamente.")
 
 
-if __name__ == "__main__":
+# ─── Mini servidor web — só pra hospedagens que exigem uma porta HTTP aberta ──
+# O Render (no plano gratuito) só oferece "Web Service", que precisa responder
+# em alguma porta HTTP pra não ser derrubado. O bot em si não precisa de servidor
+# web nenhum — isso aqui existe só pra satisfazer esse requisito da hospedagem,
+# e também dá um endpoint pro UptimeRobot "bater" e manter o serviço acordado.
+from aiohttp import web
+
+PORTA_WEB = int(os.getenv("PORT", "8080"))  # Render injeta a variável PORT automaticamente
+
+
+async def handler_status(request):
+    status = "conectado" if bot.is_ready() else "iniciando"
+    return web.json_response({
+        "status": status,
+        "bot": str(bot.user) if bot.user else None,
+    })
+
+
+async def iniciar_servidor_web():
+    app = web.Application()
+    app.router.add_get("/", handler_status)
+    app.router.add_get("/status", handler_status)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORTA_WEB)
+    await site.start()
+    print(f"✅ Mini servidor web rodando na porta {PORTA_WEB} (só pra manter o serviço vivo no Render)")
+
+
+async def main():
     if not DISCORD_TOKEN:
         print("❌ ERRO: DISCORD_TOKEN não definido no arquivo .env!")
         exit(1)
     if CANAL_ID == 0:
         print("⚠️  AVISO: CANAL_ID não definido. Use !promocoes manualmente ou configure o .env")
-    bot.run(DISCORD_TOKEN)
+
+    # Sobe o mini servidor web e o bot do Discord ao mesmo tempo, no mesmo processo
+    await iniciar_servidor_web()
+    await bot.start(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
