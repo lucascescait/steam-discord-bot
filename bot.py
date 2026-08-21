@@ -6,6 +6,7 @@ import asyncio
 import os
 import json
 from datetime import datetime
+import datetime as dt
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,12 +14,12 @@ load_dotenv()
 # ─── Configurações ───────────────────────────────────────────────────────────
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CANAL_ID = int(os.getenv("CANAL_ID", "0"))
+CANAL_ID_EPIC = int(os.getenv("CANAL_ID_EPIC", "0"))    # canal #promos-epic — se não configurado, cai no CANAL_ID
 DESCONTO_MINIMO = int(os.getenv("DESCONTO_MINIMO", "50"))
 INTERVALO_HORAS = int(os.getenv("INTERVALO_HORAS", "6"))
 NOTA_MINIMA = int(os.getenv("NOTA_MINIMA", "70"))       # % mínimo de avaliações positivas
 EXCLUIR_INDIE = os.getenv("EXCLUIR_INDIE", "true").lower() == "true"
 ITAD_API_KEY = os.getenv("ITAD_API_KEY", "")            # chave gratuita: isthereanydeal.com/apps/my/
-INTERVALO_HORAS_EPIC = int(os.getenv("INTERVALO_HORAS_EPIC", "12"))  # verificação da Epic (menos urgente que Steam)
 JOGOS_POR_PAGINA = 10
 
 jogos_enviados = set()
@@ -591,13 +592,25 @@ def criar_embed_epic(jogo: dict) -> discord.Embed:
     return embed
 
 
-@tasks.loop(hours=INTERVALO_HORAS_EPIC)
-async def verificar_jogos_gratis_epic():
-    """Verifica jogos grátis da Epic Games e anuncia cada um só uma vez (persistido em disco)."""
+# Quinta (a Epic sempre troca os jogos grátis às 13h BRT de quinta) e segunda
+# (checagem extra, caso a de quinta falhe por algum motivo).
+# discord.py trabalha em UTC — 18h em Brasília (UTC-3) equivale a 21h UTC.
+HORARIOS_VERIFICACAO_EPIC = [
+    dt.time(hour=21, minute=0, tzinfo=dt.timezone.utc),  # 18h BRT
+]
+
+
+async def checar_e_anunciar_epic():
+    """
+    Lógica de fato: busca jogos grátis da Epic e anuncia os que ainda não
+    foram enviados. Reaproveitada tanto pela task automática (quinta/segunda)
+    quanto pelo comando manual !epicatualizar (que força em qualquer dia).
+    """
     await bot.wait_until_ready()
-    canal = bot.get_channel(CANAL_ID)
+    canal_id_alvo = CANAL_ID_EPIC or CANAL_ID
+    canal = bot.get_channel(canal_id_alvo)
     if not canal:
-        print(f"[AVISO] Canal {CANAL_ID} não encontrado (Epic Games).")
+        print(f"[AVISO] Canal {canal_id_alvo} não encontrado (Epic Games).")
         return
 
     print("[INFO] Verificando jogos grátis da Epic Games...")
@@ -623,6 +636,18 @@ async def verificar_jogos_gratis_epic():
 
     salvar_epic_enviados(epic_jogos_enviados)
     print(f"[INFO] {len(novos)} jogo(s) grátis da Epic anunciado(s) para #{canal.name}")
+
+
+@tasks.loop(time=HORARIOS_VERIFICACAO_EPIC)
+async def verificar_jogos_gratis_epic():
+    """
+    Roda todo dia às 18h BRT, mas só age de fato às quintas e segundas —
+    dias em que a Epic Games costuma trocar/confirmar os jogos grátis da semana.
+    """
+    hoje = dt.datetime.now(dt.timezone.utc).weekday()  # 0=segunda, 3=quinta
+    if hoje not in (0, 3):
+        return
+    await checar_e_anunciar_epic()
 
 
 @tasks.loop(hours=INTERVALO_HORAS)
@@ -887,10 +912,13 @@ async def cmd_config(ctx):
     )
     embed.add_field(name="🔄 Próxima Verificação", value=proxima_str, inline=False)
 
+    canal_epic = bot.get_channel(CANAL_ID_EPIC or CANAL_ID)
+    canal_epic_nome = f"#{canal_epic.name}" if canal_epic else "❌ Não configurado"
     proxima_epic = verificar_jogos_gratis_epic.next_iteration
     proxima_epic_str = proxima_epic.strftime("%d/%m/%Y às %H:%M UTC") if proxima_epic else "Não agendado"
-    embed.add_field(name="🎁 Epic Games — Intervalo", value=f"a cada {INTERVALO_HORAS_EPIC}h", inline=True)
-    embed.add_field(name="🎁 Epic Games — Próxima Verificação", value=proxima_epic_str, inline=True)
+    embed.add_field(name="🎁 Epic Games — Canal", value=canal_epic_nome, inline=True)
+    embed.add_field(name="🎁 Epic Games — Dias", value="Quintas e segundas, 18h", inline=True)
+    embed.add_field(name="🎁 Epic Games — Próxima Checagem", value=proxima_epic_str, inline=True)
     embed.add_field(name="🎁 Epic Games — Já Anunciados", value=str(len(epic_jogos_enviados)), inline=True)
 
     await ctx.send(embed=embed)
@@ -931,9 +959,9 @@ async def cmd_epic_gratis(ctx):
 @bot.command(name="epicatualizar")
 @commands.has_permissions(administrator=True)
 async def cmd_epic_atualizar(ctx):
-    """Força a verificação de jogos grátis da Epic agora, respeitando o controle de já-enviados. (Admin)"""
+    """Força a verificação de jogos grátis da Epic agora, mesmo fora dos dias programados. (Admin)"""
     await ctx.send("🔄 Forçando verificação de jogos grátis da Epic Games agora...")
-    await verificar_jogos_gratis_epic()
+    await checar_e_anunciar_epic()
     await ctx.send("✅ Verificação concluída!")
 
 
