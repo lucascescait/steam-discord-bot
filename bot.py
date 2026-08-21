@@ -545,9 +545,21 @@ async def buscar_jogos_gratis_epic() -> list[dict]:
         preco_info = jogo.get("price", {}).get("totalPrice", {})
         preco_original_centavos = preco_info.get("originalPrice", 0)
 
-        product_slug = jogo.get("productSlug") or jogo.get("urlSlug") or ""
-        product_slug = product_slug.replace("/home", "")
-        url = f"https://store.epicgames.com/pt-BR/p/{product_slug}" if product_slug else "https://store.epicgames.com/pt-BR/free-games"
+        # offerMappings[0].pageSlug é o campo confiável pra montar a URL —
+        # productSlug frequentemente vem null ou com "/home" grudado (link quebrado).
+        # Ordem de fallback, do mais confiável pro menos:
+        page_slug = None
+        offer_mappings = jogo.get("offerMappings") or []
+        if offer_mappings and offer_mappings[0].get("pageSlug"):
+            page_slug = offer_mappings[0]["pageSlug"]
+        elif jogo.get("catalogNs", {}).get("mappings"):
+            catalog_mappings = jogo["catalogNs"]["mappings"]
+            if catalog_mappings and catalog_mappings[0].get("pageSlug"):
+                page_slug = catalog_mappings[0]["pageSlug"]
+        elif jogo.get("productSlug"):
+            page_slug = jogo["productSlug"].replace("/home", "")
+
+        url = f"https://store.epicgames.com/pt-BR/p/{page_slug}" if page_slug else "https://store.epicgames.com/pt-BR/free-games"
 
         imagem = ""
         for img in jogo.get("keyImages", []):
